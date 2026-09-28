@@ -67,6 +67,14 @@ std::vector<Account> accounts;
 size_t selected = 0;
 size_t savedSelected = 0;
 bool timeSynced = false;
+bool alwaysOn = false;  // power mode "always powered" (setup page): idle screen instead of deep sleep
+time_t lastSync = 0;    // epoch of the last good time sync
+const time_t RESYNC_S = 12 * 3600;     // always-powered: re-sync this often while idle
+const time_t MAX_STALE_S = 48 * 3600;  // never show codes on a clock older than this
+const uint32_t SETUP_HOLD_MS = 5000;
+const uint32_t RTC_SETUP_MAGIC = 0x53455455;  // RTC memory flag: boot into setup after restart
+
+bool timeTrusted() { return lastSync && time(nullptr) - lastSync < MAX_STALE_S; }
 String note;  // transient bottom-right message ("sent to PC", "no PC app")
 uint32_t noteUntil = 0;
 uint32_t bridgeSeenAt = 0;  // millis() of the last heartbeat from the PC bridge
@@ -275,6 +283,10 @@ String tzInfo() {
 
 void goToSleep(const String &why) {
   if (selected != savedSelected) writeSmallFile("/selected", String(selected));
+  if (alwaysOn) {  // no power switch to wake it, so restart into normal mode instead
+    showMessage("Restarting", why);
+    ESP.restart();
+  }
   showMessage("Asleep", why, "", "Slide the power switch off and", "on again to show codes.");
   display.powerDown();
   WiFi.mode(WIFI_OFF);
@@ -465,6 +477,13 @@ void handleRoot() {
        "box-sizing:border-box></textarea></label>"
        "<label><input type=checkbox name=replace> Replace all existing accounts (otherwise merge)</label><br><br>"
        "<button>Restore</button></form>";
+  bool always = readSmallFile("/power") == "always";
+  b += "<h2>Power mode</h2><form method=post action=/power><input type=hidden name=csrf value=" + csrfToken +
+       "><label><input type=radio name=mode value=battery" + String(always ? "" : " checked") +
+       "> Battery: deep sleep when idle, wake with the power switch</label><br>"
+       "<label><input type=radio name=mode value=always" + String(always ? " checked" : "") +
+       "> Always powered (USB): idle screen, centre wakes, time re-syncs every 12 h</label><br><br>"
+       "<button>Save power mode</button></form>";
   b += "<h2>Clock timezone</h2><form method=post action=/tz><input type=hidden name=csrf value=" + csrfToken +
        "><label>POSIX TZ string (only affects the clock on the badge; codes are always UTC)"
        "<input type=text name=tz list=tzs value=\"" + htmlEscape(tzInfo()) + "\"></label><datalist id=tzs>"
@@ -672,6 +691,17 @@ void handleSetPassword() {
            "<label>Repeat<input type=password name=pw2></label><button>Set password</button></form>");
 }
 
+void handlePowerMode() {
+  if (!requireAuth() || !checkCsrf()) return;
+  String mode = server.arg("mode");
+  if (mode == "always" || mode == "battery") {
+    writeSmallFile("/power", mode);
+    alwaysOn = mode == "always";
+    flash = alwaysOn ? "Power mode: always powered" : "Power mode: battery";
+  }
+  redirectHome();
+}
+
 void handleTimezone() {
   if (!requireAuth() || !checkCsrf()) return;
   String tz = server.arg("tz");
@@ -731,6 +761,7 @@ void runSetup() {
   server.on("/restore", HTTP_POST, handleRestore);
   server.on("/setpw", handleSetPassword);
   server.on("/tz", HTTP_POST, handleTimezone);
+  server.on("/power", HTTP_POST, handlePowerMode);
   server.on("/done", HTTP_POST, handleDone);
   server.on("/wifi-forget", HTTP_POST, handleWifiForget);
   server.onNotFound([] { server.send(404, "text/plain", "Not found"); });
@@ -769,12 +800,93 @@ uint8_t pollButtons() {
   return pressed;
 }
 
+// Normal-mode state. In battery mode the badge deep-sleeps when idle; in always-powered mode it
+// parks on an idle screen instead, because only a reset can wake the ESP8266 from deep sleep.
+enum NormalState { AWAKE, IDLE };
+NormalState state = AWAKE;
+String idleReason;  // why the badge is idle without codes (e.g. WiFi down); "" when it just timed out
+
+void armButtons() {
+  Serial.flush();
+  Serial.end();
+  for (int i = 0; i < BTN_COUNT; i++)
+    if (i != BTN_LEFT) pinMode(BUTTON_PINS[i], INPUT_PULLUP);
+  serialListen();
+}
+
+// Joins the saved WiFi, syncs the clock, and turns WiFi off again. Sets idleReason on failure.
+bool connectAndSync(bool quiet) {
+  if (!quiet) showMessage("BadgyTOTP", "Connecting to " + WiFi.SSID() + "...");
+  WiFi.forceSleepWake();
+  delay(1);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS) delay(100);
+  bool ok = false;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("[wifi] could not join '%s' (status %d)\n", WiFi.SSID().c_str(), WiFi.status());
+    idleReason = "Could not join " + WiFi.SSID() + ".";
+  } else {
+    Serial.printf("[wifi] joined in %lu ms, IP %s\n", millis() - start, WiFi.localIP().toString().c_str());
+    ok = syncTime();
+    if (!ok) idleReason = "NTP and HTTP time both failed.";
+  }
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  WiFi.forceSleepBegin();
+  Serial.println("[wifi] off");
+  if (ok) {
+    lastSync = time(nullptr);
+    idleReason = "";
+  }
+  return ok;
+}
+
+// Parks the badge with no codes on screen. Battery mode deep-sleeps instead.
+void enterIdle() {
+  if (!alwaysOn) goToSleep(idleReason.length() ? idleReason : String("Idle for 2 minutes."));
+  if (selected != savedSelected) {
+    writeSmallFile("/selected", String(selected));
+    savedSelected = selected;
+  }
+  if (idleReason.length()) {
+    showMessage("No codes", idleReason, "", "Press centre to retry.", "Hold centre 5 s for setup.");
+  } else {
+    showMessage("BadgyTOTP", "Press centre to show codes.", "", "", "Hold centre 5 s for setup.");
+  }
+  display.powerDown();
+  state = IDLE;
+}
+
+// Shows codes, re-syncing first if the clock is stale. Returns false (and idles) without trust.
+bool wake() {
+  if (!timeTrusted()) connectAndSync(false);  // periodic re-syncs happen in the background
+  if (!timeTrusted()) {
+    enterIdle();
+    return false;
+  }
+  idleReason = "";
+  state = AWAKE;
+  drawCodeScreen(time(nullptr));
+  display.update();
+  return true;
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(BUTTON_PINS[BTN_CENTRE], INPUT_PULLUP);
   delay(30);
   bool setupRequested = digitalRead(BUTTON_PINS[BTN_CENTRE]) == LOW;
-  Serial.printf("\n[boot] BadgyTOTP, reset: %s, centre held: %d\n", ESP.getResetReason().c_str(), setupRequested);
+  uint32_t magic = 0;
+  ESP.rtcUserMemoryRead(0, &magic, sizeof(magic));
+  if (magic == RTC_SETUP_MAGIC) {  // set by a 5 s centre hold just before a software restart
+    magic = 0;
+    ESP.rtcUserMemoryWrite(0, &magic, sizeof(magic));
+    setupRequested = true;
+  }
+  Serial.printf("\n[boot] BadgyTOTP, reset: %s, setup requested: %d\n", ESP.getResetReason().c_str(),
+                setupRequested);
 
   display.init();
   if (!LittleFS.begin()) {
@@ -782,55 +894,47 @@ void setup() {
     LittleFS.format();
     LittleFS.begin();
   }
+  alwaysOn = readSmallFile("/power") == "always";
   loadAccounts();
   savedSelected = selected = readSmallFile("/selected").toInt();
   if (selected >= accounts.size()) selected = 0;
-  Serial.printf("[boot] %u account(s), saved WiFi: '%s'\n", accounts.size(), WiFi.SSID().c_str());
+  Serial.printf("[boot] %u account(s), saved WiFi: '%s', power: %s\n", accounts.size(), WiFi.SSID().c_str(),
+                alwaysOn ? "always" : "battery");
 
   if (setupRequested || WiFi.SSID().length() == 0) runSetup();  // never returns
 
   if (accounts.empty()) {
-    showMessage("No accounts", "Hold the centre button while", "switching on to enter setup.");
-    delay(30000);
-    goToSleep("No accounts configured.");
+    idleReason = "No accounts configured.";
+    if (!alwaysOn) {
+      showMessage("No accounts", "Hold the centre button while", "switching on to enter setup.");
+      delay(30000);
+    }
+    armButtons();
+    enterIdle();
+    return;
   }
 
-  showMessage("BadgyTOTP", "Connecting to " + WiFi.SSID() + "...");
-  WiFi.mode(WIFI_STA);
-  WiFi.begin();
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS) delay(100);
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("[wifi] could not join '%s' (status %d)\n", WiFi.SSID().c_str(), WiFi.status());
-    showMessage("No WiFi", "Could not join " + WiFi.SSID() + ".", "No codes without the time.",
-                "Hold centre at power-on", "to change WiFi.");
-    delay(30000);
-    goToSleep("WiFi unavailable.");
+  bool synced = connectAndSync(false);
+  timeSynced = synced;
+  Serial.printf("[boot] time %ld, arming buttons, serial to receive-only\n", (long)time(nullptr));
+  armButtons();
+  if (!synced) {
+    if (!alwaysOn) {  // battery: show why for 30 s, then sleep
+      showMessage("No codes", idleReason, "Codes would be wrong without", "the time, so none are shown.");
+      delay(30000);
+    }
+    enterIdle();
+    return;
   }
-  Serial.printf("[wifi] joined in %lu ms, IP %s\n", millis() - start, WiFi.localIP().toString().c_str());
-
-  timeSynced = syncTime();
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  WiFi.forceSleepBegin();
-  Serial.println("[wifi] off");
-
-  if (!timeSynced) {
-    showMessage("No time sync", "NTP and HTTP both failed.", "Codes would be wrong, so", "none are shown.");
-    delay(30000);
-    goToSleep("Time sync failed.");
-  }
-
-  time_t now = time(nullptr);
-  Serial.printf("[boot] time %ld, arming buttons, serial to receive-only\n", (long)now);
-  Serial.flush();
-  Serial.end();
-  for (int i = 0; i < BTN_COUNT; i++)
-    if (i != BTN_LEFT) pinMode(BUTTON_PINS[i], INPUT_PULLUP);
-  serialListen();
-
-  drawCodeScreen(now);
+  drawCodeScreen(time(nullptr));
   display.update();
+}
+
+void rebootIntoSetup() {
+  uint32_t magic = RTC_SETUP_MAGIC;
+  ESP.rtcUserMemoryWrite(0, &magic, sizeof(magic));
+  showMessage("Setup mode", "Restarting into setup...");
+  ESP.restart();
 }
 
 void loop() {
@@ -838,14 +942,42 @@ void loop() {
   static time_t lastDrawn = 0;
   static bool dirty = false;
   static bool bridgeWas = false;
+  static uint32_t centreDownSince = 0;
+  static uint32_t lastResyncTry = 0;
 
   pollBridge();
+
+  // Holding centre for 5 s enters setup from any state, so no power switch is needed.
+  if (digitalRead(BUTTON_PINS[BTN_CENTRE]) == LOW) {
+    if (!centreDownSince) centreDownSince = millis();
+    if (millis() - centreDownSince > SETUP_HOLD_MS) rebootIntoSetup();
+  } else {
+    centreDownSince = 0;
+  }
+
+  uint8_t pressed = pollButtons();
+
+  if (state == IDLE) {
+    if (pressed & (1 << BTN_CENTRE)) {
+      if (wake()) {
+        lastInput = millis();
+        lastDrawn = time(nullptr);
+        dirty = false;
+      }
+    } else if (timeTrusted() && time(nullptr) - lastSync > RESYNC_S &&
+               (!lastResyncTry || millis() - lastResyncTry > 30UL * 60 * 1000)) {
+      lastResyncTry = millis();  // background re-sync keeps wake instant; retried every 30 min
+      if (connectAndSync(true)) lastResyncTry = 0;
+    }
+    delay(20);
+    return;
+  }
+
   if (bridgePresent() != bridgeWas) {  // show or hide the "right: type" hint
     bridgeWas = !bridgeWas;
     dirty = true;
   }
 
-  uint8_t pressed = pollButtons();
   if (pressed) {
     lastInput = millis();
     size_t n = accounts.size();
@@ -861,6 +993,12 @@ void loop() {
     }
   }
 
+  if (!timeTrusted()) {  // always-powered badge whose clock went stale while awake
+    idleReason = "Over 48 h since the last time sync.";
+    enterIdle();
+    return;
+  }
+
   time_t now = time(nullptr);
   const Account &a = accounts[selected];
   int remaining = a.period - (int)(now % a.period);
@@ -873,6 +1011,6 @@ void loop() {
     dirty = false;
   }
 
-  if (millis() - lastInput > IDLE_SLEEP_MS) goToSleep("Idle for 2 minutes.");
+  if (millis() - lastInput > IDLE_SLEEP_MS) enterIdle();
   delay(10);
 }

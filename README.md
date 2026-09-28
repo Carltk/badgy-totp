@@ -18,7 +18,8 @@ tray app can type the code into the focused window for you.
 - Time from NTP, with a fallback to the HTTP `Date` header for networks that block NTP.
   No time, no codes: it never shows a code it can't trust.
 - The next code appears in the last 7 seconds of each period.
-- Battery-friendly: WiFi is only on for the time sync, and the badge deep-sleeps when idle.
+- Two power modes: **battery** (deep sleep when idle, wake with the power switch) or **always
+  powered** on USB (idle screen, centre wakes it instantly, time re-syncs every 12 hours).
 - `badgy-bridge`: a Windows tray app that types the code when you press right on the joystick.
 
 ## Hardware
@@ -56,15 +57,16 @@ You may want to back up the stock firmware first:
 
 ## First-time setup
 
-1. Hold the **centre** button while sliding the power switch on. This enters setup mode, which is
-   also where a badge with no saved WiFi goes on its own.
+1. Hold the **centre** button while sliding the power switch on, or hold it for 5 seconds at any
+   time while the badge is running. This enters setup mode, which is also where a badge with no
+   saved WiFi goes on its own.
 2. The screen shows a WiFi network `Badgy-TOTP` and a password. Join it from a phone or laptop,
    and pick your WiFi network in the page that opens. Only WPA2-PSK networks work, not Enterprise.
 3. Once it's joined, the screen shows `http://<ip>`, `http://badgy-totp.local` and a 6-digit PIN.
    Browse to it, enter the PIN and choose an admin password.
 4. Log in as `admin`. Add accounts from an `otpauth://` link, or type an issuer, account name and
    base32 secret. When a service shows you a QR code, its "can't scan?" link reveals the key.
-5. Set the clock timezone if you want local time on the badge. Codes are always UTC, so this only
+5. Pick the power mode (see below), and set the clock timezone if you want local time on the badge. Codes are always UTC, so this only
    affects the clock.
 6. Press **Finish and sleep**. Setup mode also ends by itself after 10 minutes idle.
 
@@ -76,11 +78,20 @@ Slide the power switch on. Around 5–10 seconds later the code is on screen.
 |---|---|
 | Up / Down | Previous / next account |
 | Right | Type the code on the PC (only when `badgy-bridge` is running; see below) |
-| Centre | Full refresh, which clears e-paper ghosting |
+| Centre | Full refresh, which clears e-paper ghosting; wakes the badge in always-powered mode |
+| Centre, held 5 s | Restart into setup mode |
 | Left | Unused: its pin is the serial receive line |
 
-To wake it after it sleeps, slide the switch off and on. The ESP8266 can only wake from deep sleep
-by a reset, so the buttons can't do it.
+### Power modes
+
+Chosen on the setup page.
+
+- **Battery** (default): after 2 minutes idle the badge deep-sleeps. The ESP8266 can only wake
+  from deep sleep by a reset, so the buttons can't wake it: slide the power switch off and on.
+- **Always powered**: for a badge that lives on USB. After 2 minutes idle it clears the codes
+  and shows an idle screen, with WiFi off. **Centre** brings the codes back instantly. The time
+  re-syncs in the background every 12 hours, and if it can't sync for 48 hours it stops showing
+  codes until it can. Leaving setup restarts it straight back into normal use.
 
 ## Backup and restore
 
